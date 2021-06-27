@@ -738,8 +738,6 @@ private:
     void traverseLayersInDisplay(const sp<const DisplayDevice>& display,
                                  const LayerVector::Visitor& visitor);
 
-
-    bool canAllocateHwcDisplayIdForVDS(uint64_t usage);
     sp<StartPropertySetThread> mStartPropertySetThread;
 
     /* ------------------------------------------------------------------------
@@ -1217,7 +1215,6 @@ private:
     std::unique_ptr<scheduler::RefreshRateStats> mRefreshRateStats;
 
     std::atomic<nsecs_t> mExpectedPresentTime = 0;
-    nsecs_t mScheduledPresentTime = 0;
     hal::Vsync mHWCVsyncPendingState = hal::Vsync::DISABLE;
 
     /* ------------------------------------------------------------------------
@@ -1249,7 +1246,6 @@ private:
     bool mSetActiveConfigPending = false;
 
     bool mLumaSampling = true;
-    bool mForceLightBrightness = false;
     sp<RegionSamplingThread> mRegionSamplingThread;
     ui::DisplayPrimaries mInternalDisplayPrimaries;
 
@@ -1300,8 +1296,6 @@ private:
     int mFrameRateFlexibilityTokenCount = 0;
 
     sp<IBinder> mDebugFrameRateFlexibilityToken;
-
-    void clearCurrentStateLayerNotifiedFrameNumber();
 };
 
 } // namespace android

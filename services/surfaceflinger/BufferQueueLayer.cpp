@@ -24,7 +24,6 @@
 #include "BufferQueueLayer.h"
 
 #include <compositionengine/LayerFECompositionState.h>
-#include <compositionengine/FodExtension.h>
 #include <gui/BufferQueueConsumer.h>
 #include <system/window.h>
 
@@ -177,17 +176,10 @@ uint64_t BufferQueueLayer::getFrameNumber(nsecs_t expectedPresentTime) const {
     }
 
     for (int i = 1; i < mQueueItems.size(); i++) {
-        if (mAvailableFrameNumber != 0 &&
-            mQueueItems[i].mFrameNumber > mAvailableFrameNumber) {
-            break;
-        }
-
         const bool fenceSignaled =
                 mQueueItems[i].mFenceTime->getSignalTime() != Fence::SIGNAL_TIME_PENDING;
-        if (!latchUnsignaledBuffers()) {
-            if (!fenceSignaled) {
-                break;
-            }
+        if (!fenceSignaled) {
+            break;
         }
 
         // We don't drop frames without explicit timestamps
@@ -265,16 +257,10 @@ status_t BufferQueueLayer::updateTexImage(bool& recomputeVisibleRegions, nsecs_t
     {
         Mutex::Autolock lock(mQueueItemLock);
         for (int i = 0; i < mQueueItems.size(); i++) {
-            if (mAvailableFrameNumber != 0 &&
-                mQueueItems[i].mFrameNumber > mAvailableFrameNumber) {
-                break;
-            }
             bool fenceSignaled =
                     mQueueItems[i].mFenceTime->getSignalTime() != Fence::SIGNAL_TIME_PENDING;
-            if (!latchUnsignaledBuffers()) {
-                if (!fenceSignaled) {
-                    break;
-                }
+            if (!fenceSignaled) {
+                break;
             }
             lastSignaledFrameNumber = mQueueItems[i].mFrameNumber;
         }
@@ -528,17 +514,9 @@ status_t BufferQueueLayer::setDefaultBufferProperties(uint32_t w, uint32_t h, Pi
         return BAD_VALUE;
     }
 
-    uint64_t usageBits = getEffectiveUsage(0);
-
-    if (mName == FOD_LAYER_NAME) {
-        usageBits = getFodUsageBits(usageBits, false);
-    } else if (mName == FOD_TOUCHED_LAYER_NAME) {
-        usageBits = getFodUsageBits(usageBits, true);
-    }
-
     setDefaultBufferSize(w, h);
     mConsumer->setDefaultBufferFormat(format);
-    mConsumer->setConsumerUsageBits(usageBits);
+    mConsumer->setConsumerUsageBits(getEffectiveUsage(0));
 
     return NO_ERROR;
 }

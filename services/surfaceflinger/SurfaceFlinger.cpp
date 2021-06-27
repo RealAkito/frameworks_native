@@ -127,14 +127,6 @@
 #include "android-base/parseint.h"
 #include "android-base/stringprintf.h"
 
-#ifdef QCOM_UM_FAMILY
-#if __has_include("QtiGralloc.h")
-#include "QtiGralloc.h"
-#else
-#include "gralloc_priv.h"
-#endif
-#endif
-
 #define MAIN_THREAD ACQUIRE(mStateLock) RELEASE(mStateLock)
 
 #define ON_MAIN_THREAD(expr)                                       \
@@ -437,12 +429,6 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
 
     property_get("debug.sf.disable_client_composition_cache", value, "0");
     mDisableClientCompositionCache = atoi(value);
-
-    property_get("ro.sf.force_light_brightness", value, "0");
-    mForceLightBrightness = atoi(value);
-    
-    property_get("debug.sf.disable_hwc_overlays", value, "0");
-    mDebugDisableHWC = atoi(value);
 
     // We should be reading 'persist.sys.sf.color_saturation' here
     // but since /data may be encrypted, we need to wait until after vold
@@ -1522,10 +1508,6 @@ status_t SurfaceFlinger::getDisplayBrightnessSupport(const sp<IBinder>& displayT
     if (!displayId) {
         return NAME_NOT_FOUND;
     }
-    if (mForceLightBrightness) {
-        *outSupport = false;
-        return NO_ERROR;
-    }
     *outSupport =
             getHwComposer().hasDisplayCapability(*displayId, hal::DisplayCapability::BRIGHTNESS);
     return NO_ERROR;
@@ -1871,14 +1853,8 @@ void SurfaceFlinger::onMessageInvalidate(nsecs_t expectedVSyncTime) {
     // calculate the expected present time once and use the cached
     // value throughout this frame to make sure all layers are
     // seeing this same value.
-    if (expectedVSyncTime >= frameStart) {
-        mExpectedPresentTime = expectedVSyncTime;
-    } else {
-        mExpectedPresentTime = mScheduler->getDispSyncExpectedPresentTime(frameStart);
-    }
-
-    const nsecs_t lastScheduledPresentTime = mScheduledPresentTime;
-    mScheduledPresentTime = expectedVSyncTime;
+    const nsecs_t lastExpectedPresentTime = mExpectedPresentTime.load();
+    mExpectedPresentTime = expectedVSyncTime;
 
     // When Backpressure propagation is enabled we want to give a small grace period
     // for the present fence to fire instead of just giving up on this frame to handle cases
@@ -1908,7 +1884,7 @@ void SurfaceFlinger::onMessageInvalidate(nsecs_t expectedVSyncTime) {
     const TracedOrdinal<bool> frameMissed = {"PrevFrameMissed",
                                              framePending ||
                                                      (previousPresentTime >= 0 &&
-                                                      (lastScheduledPresentTime <
+                                                      (lastExpectedPresentTime <
                                                        previousPresentTime - frameMissedSlop))};
     const TracedOrdinal<bool> hwcFrameMissed = {"PrevHwcFrameMissed",
                                                 mHadDeviceComposition && frameMissed};
@@ -2000,7 +1976,6 @@ void SurfaceFlinger::onMessageInvalidate(nsecs_t expectedVSyncTime) {
 
         refreshNeeded = handleMessageTransaction();
         refreshNeeded |= handleMessageInvalidate();
-        clearCurrentStateLayerNotifiedFrameNumber();
         if (mTracingEnabled) {
             mAddCompositionStateToTrace =
                     mTracing.flagIsSetLocked(SurfaceTracing::TRACE_COMPOSITION);
@@ -2363,10 +2338,8 @@ void SurfaceFlinger::postComposition()
     }
     getBE().mLastSwapTime = currentTime;
 
-#ifndef DISABLE_POSTRENDER_CLEANUP
     // Cleanup any outstanding resources due to rendering a prior frame.
     getRenderEngine().cleanupPostRender();
-#endif
 
     {
         std::lock_guard lock(mTexturePoolMutex);
@@ -2606,11 +2579,6 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
                                          const DisplayDeviceState& state) {
     int width = 0;
     int height = 0;
-#ifdef QCOM_UM_FAMILY
-    bool canAllocateHwcForVDS = false;
-#else
-    bool canAllocateHwcForVDS = true;
-#endif
     ui::PixelFormat pixelFormat = static_cast<ui::PixelFormat>(PIXEL_FORMAT_UNKNOWN);
     if (state.physical) {
         const auto& activeConfig =
@@ -2627,21 +2595,6 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
         status = state.surface->query(NATIVE_WINDOW_FORMAT, &intPixelFormat);
         ALOGE_IF(status != NO_ERROR, "Unable to query format (%d)", status);
         pixelFormat = static_cast<ui::PixelFormat>(intPixelFormat);
-#ifdef QCOM_UM_FAMILY
-        if (mUseHwcVirtualDisplays || getHwComposer().isUsingVrComposer()) {
-            if (maxVirtualDisplaySize == 0 ||
-                ((uint64_t)width <= maxVirtualDisplaySize &&
-                (uint64_t)height <= maxVirtualDisplaySize)) {
-                uint64_t usage = 0;
-                // Replace with native_window_get_consumer_usage ?
-                status = state .surface->getConsumerUsage(&usage);
-                ALOGW_IF(status != NO_ERROR, "Unable to query usage (%d)", status);
-                if ((status == NO_ERROR) && canAllocateHwcDisplayIdForVDS(usage)) {
-                   canAllocateHwcForVDS = true;
-               }
-            }
-        }
-#endif
     } else {
         // Virtual displays without a surface are dormant:
         // they have external state (layer stack, projection,
@@ -2658,8 +2611,7 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
     builder.setIsSecure(state.isSecure);
     builder.setLayerStackId(state.layerStack);
     builder.setPowerAdvisor(&mPowerAdvisor);
-    builder.setUseHwcVirtualDisplays((mUseHwcVirtualDisplays && canAllocateHwcForVDS) ||
-                                     getHwComposer().isUsingVrComposer());
+    builder.setUseHwcVirtualDisplays(mUseHwcVirtualDisplays || getHwComposer().isUsingVrComposer());
     builder.setName(state.displayName);
     const auto compositionDisplay = getCompositionEngine().createDisplay(builder.build());
 
@@ -2673,9 +2625,8 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
 
     if (state.isVirtual()) {
         sp<VirtualDisplaySurface> vds =
-                new VirtualDisplaySurface(getHwComposer(), displayId, state.surface,
-                                          bqProducer, bqConsumer, state.displayName,
-                                          state.isSecure);
+                new VirtualDisplaySurface(getHwComposer(), displayId, state.surface, bqProducer,
+                                          bqConsumer, state.displayName);
 
         displaySurface = vds;
         producer = vds;
@@ -3073,7 +3024,6 @@ void SurfaceFlinger::commitTransactionLocked() {
             // Ensure any buffers set to display on any children are released.
             if (l->isRemovedFromCurrentState()) {
                 l->latchAndReleaseBuffer();
-                l->clearNotifiedFrameNumber();
             }
 
             // If the layer has been removed and has no parent, then it will not be reachable
@@ -3410,6 +3360,10 @@ void SurfaceFlinger::setTransactionState(
     }
 
     const bool pendingTransactions = itr != mTransactionQueues.end();
+    // Expected present time is computed and cached on invalidate, so it may be stale.
+    if (!pendingTransactions) {
+        mExpectedPresentTime = calculateExpectedPresentTime(systemTime());
+    }
 
     if (pendingTransactions || !transactionIsReadyToBeApplied(desiredPresentTime, states)) {
         mTransactionQueues[applyToken].emplace(states, displays, flags, desiredPresentTime,
@@ -4547,9 +4501,12 @@ void SurfaceFlinger::recordBufferingStats(const std::string& layerName,
 
 void SurfaceFlinger::dumpFrameEventsLocked(std::string& result) {
     result.append("Layer frame timestamps:\n");
-    // Traverse all layers to dump frame-events for each layer
-    mCurrentState.traverseInZOrder(
-        [&] (Layer* layer) { layer->dumpFrameEvents(result); });
+
+    const LayerVector& currentLayers = mCurrentState.layersSortedByZ;
+    const size_t count = currentLayers.size();
+    for (size_t i=0 ; i<count ; i++) {
+        currentLayers[i]->dumpFrameEvents(result);
+    }
 }
 
 void SurfaceFlinger::dumpBufferingStats(std::string& result) const {
@@ -5479,15 +5436,6 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& displayToken,
         display = getDisplayDeviceLocked(displayToken);
         if (!display) return NAME_NOT_FOUND;
 
-        if (display->isPrimary()) {
-            const auto physicalOrientation = display->getPhysicalOrientation();
-            renderAreaRotation = ui::Transform::toRotationFlags(rotation + physicalOrientation);
-            if (renderAreaRotation == ui::Transform::ROT_INVALID) {
-                ALOGE("%s: Invalid rotation: %s", __FUNCTION__, toCString(rotation));
-                renderAreaRotation = ui::Transform::ROT_0;
-            }
-        }
-
         // set the requested width/height to the logical display viewport size
         // by default
         if (reqWidth == 0 || reqHeight == 0) {
@@ -5561,7 +5509,6 @@ status_t SurfaceFlinger::captureScreen(uint64_t displayOrLayerStack, Dataspace* 
     uint32_t width;
     uint32_t height;
     ui::Transform::RotationFlags captureOrientation;
-    ui::Rotation correctOrientation;
     {
         Mutex::Autolock lock(mStateLock);
         display = getDisplayByIdOrLayerStack(displayOrLayerStack);
@@ -5573,31 +5520,7 @@ status_t SurfaceFlinger::captureScreen(uint64_t displayOrLayerStack, Dataspace* 
         height = uint32_t(display->getViewport().height());
 
         const auto orientation = display->getOrientation();
-        const auto physicalOrientation = display->getPhysicalOrientation();
-        if (display->isPrimary()) {
-            switch (physicalOrientation) {
-            case ui::Rotation::Rotation0:
-                correctOrientation = orientation;
-                break;
-            case ui::Rotation::Rotation90:
-                correctOrientation = orientation + ui::Rotation::Rotation270;
-                break;
-
-            case ui::Rotation::Rotation180:
-                correctOrientation = orientation + ui::Rotation::Rotation180;
-                break;
-
-            case ui::Rotation::Rotation270:
-                correctOrientation = orientation + ui::Rotation::Rotation90;
-                break;
-
-            default:
-                break;
-            }
-            captureOrientation = ui::Transform::toRotationFlags(correctOrientation);
-        } else {
-            captureOrientation = ui::Transform::toRotationFlags(orientation);
-        }
+        captureOrientation = ui::Transform::toRotationFlags(orientation);
 
         switch (captureOrientation) {
             case ui::Transform::ROT_90:
@@ -5823,7 +5746,7 @@ status_t SurfaceFlinger::captureScreenCommon(RenderArea& renderArea,
 
     // TODO(b/116112787) Make buffer usage a parameter.
     const uint32_t usage = GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN |
-            GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_COMPOSER;
+            GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE;
     *outBuffer =
             getFactory().createGraphicBuffer(renderArea.getReqWidth(), renderArea.getReqHeight(),
                                              static_cast<android_pixel_format>(reqPixelFormat), 1,
@@ -6133,26 +6056,6 @@ status_t SurfaceFlinger::setDesiredDisplayConfigSpecsInternal(
     return NO_ERROR;
 }
 
-#ifdef QCOM_UM_FAMILY
-bool SurfaceFlinger::canAllocateHwcDisplayIdForVDS(uint64_t usage) {
-    uint64_t flag_mask_pvt_wfd = ~0;
-    uint64_t flag_mask_hw_video = ~0;
-    char value[PROPERTY_VALUE_MAX] = {};
-    property_get("vendor.display.vds_allow_hwc", value, "0");
-    int allowHwcForVDS = atoi(value);
-    // Reserve hardware acceleration for WFD use-case
-    // GRALLOC_USAGE_PRIVATE_WFD + GRALLOC_USAGE_HW_VIDEO_ENCODER = WFD using HW composer.
-    flag_mask_pvt_wfd = GRALLOC_USAGE_PRIVATE_WFD;
-    flag_mask_hw_video = GRALLOC_USAGE_HW_VIDEO_ENCODER;
-    return (allowHwcForVDS || ((usage & flag_mask_pvt_wfd) &&
-            (usage & flag_mask_hw_video)));
-}
-#else
-bool SurfaceFlinger::canAllocateHwcDisplayIdForVDS(uint64_t) {
-    return true;
-}
-#endif
-
 status_t SurfaceFlinger::setDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken,
                                                       int32_t defaultConfig,
                                                       float primaryRefreshRateMin,
@@ -6434,13 +6337,6 @@ void SurfaceFlinger::enableRefreshRateOverlay(bool enable) {
             mRefreshRateOverlay->changeRefreshRate(mRefreshRateConfigs->getCurrentRefreshRate());
         }
     }));
-}
-
-void SurfaceFlinger::clearCurrentStateLayerNotifiedFrameNumber() {
-    Mutex::Autolock _l(mStateLock);
-    mCurrentState.traverseInZOrder([](Layer* layer) {
-        layer->clearNotifiedFrameNumber();
-    });
 }
 
 } // namespace android
